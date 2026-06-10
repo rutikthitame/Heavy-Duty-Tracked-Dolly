@@ -1,6 +1,6 @@
 # Heavy-Duty Tracked Dolly 🚜
 
-<img width="1483" height="803" alt="IMG_0396" src="https://github.com/user-attachments/assets/4e895d89-f4a8-4f91-8607-bdd579638bf7" />
+<img width="2483" height="1803" alt="IMG_0396" src="https://github.com/user-attachments/assets/4e895d89-f4a8-4f91-8607-bdd579638bf7" />
 
 
 An ESP32-controlled, high-torque tracked dolly designed for heavy agricultural automation and load transport. Capable of pulling loads exceeding 500kg, this dolly is built to handle rough terrain and streamline tasks like feeding, seeding, and manure management.
