@@ -1,0 +1,190 @@
+#include <Wire.h>
+#include <Adafruit_MCP4725.h>
+
+// ==========================================
+// HARDWARE SETTINGS
+// ==========================================
+
+// I2C Addresses for your two DACs
+#define DAC_LEFT_ADDR  0x62 // Default Adafruit address
+#define DAC_RIGHT_ADDR 0x63 // Solder ADDR jumper to VCC for the 2nd DAC
+
+Adafruit_MCP4725 dacLeft;
+Adafruit_MCP4725 dacRight;
+
+// ESP32 Pins
+#define PIN_CH1_STEERING 18 
+#define PIN_CH2_THROTTLE 19 
+#define PIN_DIR_LEFT     25 
+#define PIN_DIR_RIGHT    26 
+
+// Set to true if a motor spins backward when it should go forward
+#define INVERT_LEFT_DIR  false
+#define INVERT_RIGHT_DIR false
+
+// ==========================================
+// TUNING PARAMETERS (SOFT START)
+// ==========================================
+#define MAX_DAC_OUT      4095  // 12-bit max (outputs ~3.3V or 5V depending on DAC power)
+#define RAMP_STEP        10    // Speed increment per cycle (Lower = smoother/slower, Higher = jerkier/faster)
+#define RAMP_DELAY_MS    5     // Milliseconds between speed increments
+
+// ==========================================
+// GLOBAL VARIABLES
+// ==========================================
+volatile unsigned long timer1 = 0;
+volatile unsigned long timer2 = 0;
+volatile int pwmSteering = 1500;
+volatile int pwmThrottle = 1500;
+volatile unsigned long lastSignalTime = 0;
+
+int currentSpeedLeft = 0;
+int currentSpeedRight = 0;
+unsigned long lastRampTime = 0;
+
+// ==========================================
+// INTERRUPT SERVICE ROUTINES (ISRs)
+// ==========================================
+// These capture the RC PWM signals perfectly in the background
+void IRAM_ATTR isrSteering() {
+  if (digitalRead(PIN_CH1_STEERING)) {
+    timer1 = micros();
+  } else {
+    pwmSteering = micros() - timer1;
+    lastSignalTime = millis(); // Reset failsafe timer
+  }
+}
+
+void IRAM_ATTR isrThrottle() {
+  if (digitalRead(PIN_CH2_THROTTLE)) {
+    timer2 = micros();
+  } else {
+    pwmThrottle = micros() - timer2;
+    lastSignalTime = millis(); // Reset failsafe timer
+  }
+}
+
+// ==========================================
+// SETUP
+// ==========================================
+void setup() {
+  Serial.begin(115200);
+  
+  // Speed up I2C for faster DAC updates
+  Wire.begin();
+  Wire.setClock(400000); 
+
+  if(!dacLeft.begin(DAC_LEFT_ADDR)) {
+    Serial.println("Left DAC not found!");
+  }
+  if(!dacRight.begin(DAC_RIGHT_ADDR)) {
+    Serial.println("Right DAC not found!");
+  }
+
+  // Set initial DAC output to 0
+  dacLeft.setVoltage(0, false);
+  dacRight.setVoltage(0, false);
+
+  pinMode(PIN_CH1_STEERING, INPUT);
+  pinMode(PIN_CH2_THROTTLE, INPUT);
+  pinMode(PIN_DIR_LEFT, OUTPUT);
+  pinMode(PIN_DIR_RIGHT, OUTPUT);
+
+  // Attach Interrupts
+  attachInterrupt(digitalPinToInterrupt(PIN_CH1_STEERING), isrSteering, CHANGE);
+  attachInterrupt(digitalPinToInterrupt(PIN_CH2_THROTTLE), isrThrottle, CHANGE);
+}
+
+// ==========================================
+// HELPER: MAP RC SIGNAL TO DAC RANGE
+// ==========================================
+int mapJoystick(int pwm) {
+  // 1. Failsafe bounds check (if signal gets garbage data)
+  if (pwm < 900 || pwm > 2100) return 0;
+  
+  // 2. Deadband (keeps dolly perfectly still when sticks are centered)
+  if (pwm > 1450 && pwm < 1550) return 0; 
+  
+  // 3. Map Forward/Right
+  if (pwm >= 1550) {
+    pwm = min(pwm, 2000);
+    return map(pwm, 1550, 2000, 0, MAX_DAC_OUT);
+  }
+  
+  // 4. Map Reverse/Left
+  if (pwm <= 1450) {
+    pwm = max(pwm, 1000);
+    return map(pwm, 1450, 1000, 0, -MAX_DAC_OUT);
+  }
+  
+  return 0;
+}
+
+// ==========================================
+// HELPER: APPLY SOFT START RAMPING
+// ==========================================
+int smoothRamp(int current, int target) {
+  if (current < target) {
+    current += RAMP_STEP;
+    if (current > target) current = target; // Clamp
+  } else if (current > target) {
+    current -= RAMP_STEP;
+    if (current < target) current = target; // Clamp
+  }
+  return current;
+}
+
+// ==========================================
+// MAIN LOOP
+// ==========================================
+void loop() {
+  unsigned long currentMillis = millis();
+
+  // Run the motor update loop strictly at our defined interval
+  if (currentMillis - lastRampTime >= RAMP_DELAY_MS) {
+    lastRampTime = currentMillis;
+
+    int targetLeft = 0;
+    int targetRight = 0;
+
+    // FAILSAFE: If the remote is turned off, stop everything
+    if (currentMillis - lastSignalTime > 500) {
+      targetLeft = 0;
+      targetRight = 0;
+    } else {
+      // 1. Read and map raw stick values
+      int throttleRaw = mapJoystick(pwmThrottle);
+      int steeringRaw = mapJoystick(pwmSteering);
+
+      // 2. Tank Mix Algorithm (Unmixed Remote Input -> Differential Track Output)
+      targetLeft = throttleRaw + steeringRaw;
+      targetRight = throttleRaw - steeringRaw;
+
+      // 3. Constrain to DAC limits
+      targetLeft = constrain(targetLeft, -MAX_DAC_OUT, MAX_DAC_OUT);
+      targetRight = constrain(targetRight, -MAX_DAC_OUT, MAX_DAC_OUT);
+    }
+
+    // 4. Apply Soft Start (smooth acceleration/deceleration)
+    currentSpeedLeft = smoothRamp(currentSpeedLeft, targetLeft);
+    currentSpeedRight = smoothRamp(currentSpeedRight, targetRight);
+
+    // 5. Output to Left Motor Controller
+    if (currentSpeedLeft >= 0) {
+      digitalWrite(PIN_DIR_LEFT, INVERT_LEFT_DIR ? LOW : HIGH);
+      dacLeft.setVoltage(currentSpeedLeft, false);
+    } else {
+      digitalWrite(PIN_DIR_LEFT, INVERT_LEFT_DIR ? HIGH : LOW);
+      dacLeft.setVoltage(abs(currentSpeedLeft), false);
+    }
+
+    // 6. Output to Right Motor Controller
+    if (currentSpeedRight >= 0) {
+      digitalWrite(PIN_DIR_RIGHT, INVERT_RIGHT_DIR ? LOW : HIGH);
+      dacRight.setVoltage(currentSpeedRight, false);
+    } else {
+      digitalWrite(PIN_DIR_RIGHT, INVERT_RIGHT_DIR ? HIGH : LOW);
+      dacRight.setVoltage(abs(currentSpeedRight), false);
+    }
+  }
+}
